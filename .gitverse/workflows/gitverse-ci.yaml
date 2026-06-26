@@ -1,0 +1,66 @@
+name: pdtv CI
+
+# Триггеры запуска workflow
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+jobs:
+
+  check:
+
+    name: Syntax and dependency check
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check bash syntax
+        run: bash -n pdtv.sh && echo "Syntax OK"
+
+      - name: Run shellcheck
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -S warning pdtv.sh && echo "shellcheck clean"
+          else
+            sudo apt-get update && sudo apt-get install -y shellcheck
+            shellcheck -S warning pdtv.sh && echo "shellcheck clean"
+          fi
+
+      - name: Check required dependencies
+        run: |
+          for cmd in bash find sed sort paste grep tr wc mktemp; do
+            command -v "$cmd" >/dev/null 2>&1 \
+              && echo "OK: $cmd" \
+              || echo "MISSING: $cmd"
+          done
+
+      - name: Check optional dependencies
+        run: |
+          for cmd in zip unzip 7z tar gzip bzip2 xz gpg getent zenity xdg-open numfmt; do
+            command -v "$cmd" >/dev/null 2>&1 \
+              && echo "OK: $cmd" \
+              || echo "optional missing: $cmd"
+          done
+
+      - name: List modules (smoke test)
+        run: bash pdtv.sh --list-modules
+
+      - name: Help and version (smoke test)
+        run: |
+          bash pdtv.sh --help
+          bash pdtv.sh --version
+
+      - name: Display event
+        run: echo ${{ gitverse.event_name }}
+
+      - name: Display actor
+        run: echo ${{ gitverse.actor }}
