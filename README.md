@@ -75,19 +75,6 @@ ZIP обрабатывается первым: несколько вложени
 или разово из CLI: `--only blanks,pdtv`, `--skip blanks,chmod`, `--no-extract` и т.п.
 Список модулей и их статус — `--list-modules`.
 
-## Структура поставки
-
-- `pdtv.sh` — основной исполняемый скрипт;
-- `README.md` — описание и инструкция;
-- `CHANGELOG.md` — история изменений;
-- `LICENSE.txt` — лицензия Apache 2.0;
-- `NOTICE` — уведомление об авторстве и лицензии;
-- `AUTHORS.md` — сведения об авторе;
-- `CONTRIBUTING.md` — как вносить изменения;
-- `CODE_OF_CONDUCT.md` — кодекс поведения;
-- `SECURITY.md` — политика безопасности;
-- `.gitverse/workflows/gitverse-ci.yaml` — конвейер CI (синтаксис, shellcheck, зависимости, smoke-тесты).
-
 ## Установка
 
 ```bash
