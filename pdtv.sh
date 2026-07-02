@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # pdtv — Обработчик входящих документов: распаковка, ПДТВ
-# Версия: 1.0
+# Версия: 1.1
 # Совместимость: Astra Linux 1.7+ , Alt Linux 10.4+
 #===============================================================================
 #
@@ -90,7 +90,7 @@
 set -Eeuo pipefail
 
 # === Блок: версия ===
-VERSION="1.0"
+VERSION="1.1"
 
 #===============================================================================
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -1113,13 +1113,17 @@ znt() {
 # Каталог рабочего стола: xdg → Astra Fly (~/Desktops/Desktop1) → рус/англ варианты
 desktop_dir_path() {
     local d
+    # Astra (fly) держит НЕСКОЛЬКО рабочих столов в ~/Desktops/Desktop1..N и
+    # показывает первый. xdg-user-dir на таких машинах часто отдаёт ~/Desktop,
+    # которого на экране НЕТ — ярлык «пропадает». Поэтому Astra-каталог первым.
+    for d in "$HOME/Desktops/Desktop1" "$HOME/Рабочий стол"; do
+        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
+    done
     if command -v xdg-user-dir >/dev/null 2>&1; then
         d="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
         [[ -n "$d" && -d "$d" ]] && { printf '%s' "$d"; return 0; }
     fi
-    for d in "$HOME/Desktops/Desktop1" "$HOME/Рабочий стол" "$HOME/Desktop"; do
-        [[ -d "$d" ]] && { printf '%s' "$d"; return 0; }
-    done
+    [[ -d "$HOME/Desktop" ]] && { printf '%s' "$HOME/Desktop"; return 0; }
     printf '%s' "$HOME/Desktop"   # будет создан
 }
 
@@ -1141,20 +1145,32 @@ build_cli_flags() {
     printf '%s' "$f"
 }
 
-# Создать .desktop-ярлык на рабочем столе с текущей конфигурацией
+# Создать .desktop-ярлык на рабочем столе с текущей конфигурацией.
+# Имя файла и подпись включают ФИО дежурного: у каждого дежурного СВОЙ ярлык
+# (pdtv_Иванов_И.И..desktop) — второй ярлык больше не затирает первый.
+# Повторное создание с тем же ФИО обновляет его же ярлык (это ожидаемо).
 make_desktop_shortcut() {
-    local script desktop_dir target flags
+    local script desktop_dir target flags who suffix name
     script="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "$0")"
     desktop_dir="$(desktop_dir_path)"
     mkdir -p "$desktop_dir" 2>/dev/null || true
-    target="$desktop_dir/pdtv.desktop"
+    who="$(trim "${OFFICER_CLI:-}")"
+    suffix=""
+    name="ПДТВ — обработка входящих"
+    if [[ -n "$who" ]]; then
+        # Имя файла: пробелы → _, выкидываем опасные для fly/шелла символы.
+        suffix="_${who//[\/\\\"\'!]/}"
+        suffix="${suffix// /_}"
+        name+=" ($who)"
+    fi
+    target="$desktop_dir/pdtv${suffix}.desktop"
     flags="$(build_cli_flags)"
 
     cat > "$target" <<EOF
 [Desktop Entry]
 Version=1.0
 Type=Application
-Name=ПДТВ — обработка входящих
+Name=$name
 Comment=Обработка входящих по сохранённой конфигурации (без окон и терминала)
 Exec=bash "$script"$flags
 Terminal=false
@@ -1349,6 +1365,15 @@ main() {
 
     # Базовые каталоги (Входящие, ПДТВ, Отработанные) — при отсутствии предложить создать
     ensure_base_dirs
+
+    # Замок от двойного запуска: у каждого дежурного свой ярлык, но рабочая
+    # папка общая — параллельная обработка перемешала бы перенос файлов.
+    # flock — штатный util-linux; замок снимается сам при выходе процесса.
+    if command -v flock >/dev/null 2>&1 && exec 9>"$ROOT/.pdtv.lock"; then
+        if ! flock -n 9; then
+            die "Обработка уже идёт (другой запуск в «$ROOT») — дождитесь завершения"
+        fi
+    fi
 
     [[ "$ENABLE_PDTV" == true ]] && resolve_officer
     vlog "Пользователь: ${USER:-?} | GECOS: '${GECOS_FULL}' | ФИО: '${FIO}'"
