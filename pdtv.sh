@@ -90,7 +90,7 @@
 set -Eeuo pipefail
 
 # === Блок: версия ===
-VERSION="1.1"
+VERSION="1.2"
 
 #===============================================================================
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -101,7 +101,7 @@ VERSION="1.1"
 #===============================================================================
 
 # ── ГЛАВНОЕ: РАБОЧАЯ ПАПКА (корень) ──────────────────────────────────────────
-# Внутри неё скрипт работает с подпапками: «Входящие», «ПДТВ», «! Отработанные».
+# Внутри неё скрипт работает с подпапками: «Входящие», «ПДТВ», «00_Отработанные».
 # Сменить можно здесь, ключом --root или в окне настроек (первое поле).
 ROOT="/DOCS/Общая"                   # корень (переопределяется: --root / GUI)
 
@@ -120,6 +120,17 @@ SIGNATURE="{фио}"
 DUTY_OFFICER=""                      # ФИО дежурного вручную (пусто → GECOS/запрос)
 
 #--- ПОВЕДЕНИЕ ----------------------------------------------------------------
+# Имя каталога-архива внутри «Входящих». Прежнее имя «! Отработанные» ломало
+# автооткрытие файлов: старый xdg-open (Astra 1.7) подставляет путь в команду без
+# кавычек, и сегмент «! » разрывает его на слова → окно «файл не существует».
+# При запуске старый каталог автоматически переименовывается в новый (MIGRATE_DONE_DIR).
+DONE_DIR_NAME="00_Отработанные"      # каталог обработанного (было: «! Отработанные»)
+MIGRATE_DONE_DIR=true                # true → переименовать «! Отработанные» → DONE_DIR_NAME
+# Бланки, которые скрипт сам упаковал в ZIP (модуль M2), после прогона убираются
+# в архив дня. Файлы, ПРИШЕДШИЕ в архивах, туда не уезжают — они остаются во
+# «Входящих» вместе с остальным извлечённым содержимым.
+MOVE_M2_BLANKS_TO_DONE=true          # false → упакованные бланки тоже остаются во «Входящих»
+
 CHMOD_MODE="777"                     # права на общий каталог (775 — безопаснее)
 OPEN_LIMIT=10                        # макс. число одновременно открываемых файлов
 SHOW_HUMAN_SIZE=false                # true → добавлять (КиБ/МиБ) в перечень ПДТВ; по умолчанию только байты
@@ -169,7 +180,9 @@ _ROOT_FROM_CLI=false                        # был ли ROOT задан клю
 # Заполняется при запуске через окно и подставляется при следующем старте.
 CONFIG_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/pdtv/config"
 declare -a _PRED=() _OPEN_PRED=() _DOC_PRED=() _ARC_PRED=() _EXCL_PRED=()
+declare -A _M2_BLANKS=()                    # имена бланков, упакованных модулем M2
 PERIOD=""; OTRABOTKA_P=""; PDTV_P=""        # период-каталог (месяц/дата) — заполняет init_paths
+OTRABOTKA_OLD=""                            # прежнее имя каталога-архива (миграция)
 
 # Палитра (заполняется setup_colors; по умолчанию пусто = без цвета)
 C_RESET=''; C_DIM=''; C_BLD=''; C_RED=''; C_GRN=''; C_YEL=''; C_BLU=''; C_CYA=''; C_MAG=''
@@ -354,10 +367,69 @@ run() {
 }
 
 # Открыть файл в фоне, не роняя прогон. Подсубшелл с «|| true» гасит ошибку
-# xdg-open (нет DISPLAY/обработчика), иначе фоновая задача дёргала бы ERR-trap.
+# открывалки (нет DISPLAY/обработчика), иначе фоновая задача дёргала бы ERR-trap.
+#
+# ПОЧЕМУ ЦЕПОЧКА, А НЕ ПРОСТО xdg-open. В старых xdg-utils (Astra 1.7) путь
+# подставляется в строку `Exec=` .desktop-файла через sed+eval БЕЗ кавычек. Путь
+# с пробелами разлетается на слова, приложение получает огрызок и рисует окно
+# «файл не существует». `gio open` (GLib) кодирует путь в URI сам и этой болезнью
+# не страдает — поэтому пробуем его первым, а xdg-open остаётся запасным.
+# fly-open — родная открывалка Astra, знает ассоциации Fly.
+OPEN_TOOL=auto                       # auto|gio|fly-open|xdg-open — чем открывать
+OPEN_TOOLS=( gio fly-open xdg-open ) # порядок перебора в режиме auto
+
+# Список открывалок, которые есть в системе (в режиме auto — все найденные, по порядку).
+_open_tools() {
+    local -a want=()
+    case "$OPEN_TOOL" in
+        auto) want=( "${OPEN_TOOLS[@]}" ) ;;
+        *)    want=( "$OPEN_TOOL" ) ;;
+    esac
+    local t found=1
+    for t in "${want[@]}"; do
+        command -v "$t" >/dev/null 2>&1 && { printf '%s\n' "$t"; found=0; }
+    done
+    return $found
+}
+
+# gio требует подкоманду open; остальные принимают путь первым аргументом.
+_open_run() {
+    local tool="$1" f="$2"
+    case "$tool" in
+        gio) gio open "$f" ;;
+        *)   "$tool" "$f" ;;
+    esac
+}
+
+# Перебор открывалок до первой успешной. Выполняется в фоновом субшелле.
+_open_chain() {
+    local f="$1" tool
+    while IFS= read -r tool; do
+        [[ -n "$tool" ]] || continue
+        if [[ "$VERBOSE" == true ]]; then
+            vlog "  Открываю ($tool): $f"
+            _open_run "$tool" "$f" 2>&1 | while IFS= read -r l; do vlog "  [$tool] $l"; done
+            (( ${PIPESTATUS[0]} == 0 )) && return 0
+            vlog "  [$tool] не смог открыть — пробую следующую"
+        else
+            _open_run "$tool" "$f" >/dev/null 2>&1 && return 0
+        fi
+    done < <(_open_tools)
+    warn "  не удалось открыть: ${f##*/}"
+    return 0
+}
+
 open_bg() {
-    command -v xdg-open >/dev/null 2>&1 || return 0
-    ( xdg-open "$1" >/dev/null 2>&1 || true ) &
+    local f="$1"
+    if [[ ! -e "$f" ]]; then
+        warn "  не открыт (файла нет): $f"; return 0
+    fi
+    if ! _open_tools >/dev/null; then
+        vlog "  открывалка не найдена — пропуск: ${f##*/}"; return 0
+    fi
+    # «|| true» обязателен: ненулевой rc фонового субшелла (в т.ч. из-за pipefail)
+    # дёрнул бы ERR-trap и выплюнул ложную ошибку.
+    ( _open_chain "$f" || true ) &
     return 0
 }
 
@@ -367,7 +439,8 @@ open_bg() {
 init_paths() {
     PDTV="$ROOT/ПДТВ"
     VHOD="$ROOT/Входящие"
-    OTRABOTKA="$VHOD/! Отработанные"
+    OTRABOTKA="$VHOD/$DONE_DIR_NAME"
+    OTRABOTKA_OLD="$VHOD/! Отработанные"     # прежнее имя (для миграции)
     CHMOD_TARGET="$ROOT"
 
     # Период-каталог: с уровнем месяца «01 Январь/12.01.2026» или просто «12.01.2026».
@@ -483,6 +556,30 @@ resolve_officer() {
     return 0
 }
 
+# Распаковка «через тамбур»: архив вскрывается во временный каталог, содержимое
+# переносится в целевой через _mv_into (--backup=numbered). Иначе два архива с
+# одноимёнными файлами («акт.txt» и там и там) затирали бы друг друга: unzip -o,
+# 7z -y и tar перезаписывают молча, и один документ ПРОПАДАЛ безвозвратно.
+# Возврат: 0 = ок, 2 = распаковщик не справился.
+_extract_via_tmp() {
+    local dst="$1"; shift            # каталог назначения
+    local tmp rc=0
+    tmp="$(mktemp -d "${dst}/.unpack.XXXXXX" 2>/dev/null)" || return 2
+    # «$@» — команда распаковки; {} заменяем на временный каталог
+    local -a cmd=()
+    local a
+    for a in "$@"; do cmd+=( "${a//\{\}/$tmp}" ); done
+    "${cmd[@]}" >/dev/null 2>&1 || rc=2
+
+    if (( rc == 0 )); then
+        local -a items=()
+        mapfile -d '' items < <(find "$tmp" -mindepth 1 -maxdepth 1 -print0 2>/dev/null || true)
+        (( ${#items[@]} )) && _mv_into "$dst" "${items[@]}"
+    fi
+    rm -rf -- "$tmp" 2>/dev/null || true
+    return $rc
+}
+
 #===============================================================================
 # МОДУЛЬ M1 — Подготовка окружения
 #===============================================================================
@@ -514,8 +611,15 @@ archive_documents() {
     (( ${#files[@]} )) || { vlog "  Бланков нет"; return 0; }
     local f
     for f in "${files[@]}"; do
-        if [[ "$DRY_RUN" == true ]]; then log "[would] zip -m: ${f##*/}"; STATS[blanks]=$(( STATS[blanks] + 1 )); continue; fi
+        # Запоминаем ИМЯ бланка: M3 распакует его же zip обратно в «Загрузку», и в M4
+        # надо отличить его от файлов, приехавших в чужих архивах. В dry-run список
+        # тоже заполняем — иначе «[would] mv» в M4 показал бы неправду.
+        if [[ "$DRY_RUN" == true ]]; then
+            log "[would] zip -m: ${f##*/}"; _M2_BLANKS["${f##*/}"]=1
+            STATS[blanks]=$(( STATS[blanks] + 1 )); continue
+        fi
         if zip -r -j -m -q "${f%.*}.zip" "$f" >/dev/null 2>&1; then
+            _M2_BLANKS["${f##*/}"]=1
             STATS[blanks]=$(( STATS[blanks] + 1 ))
         else
             warn "  ошибка упаковки: ${f##*/}"
@@ -538,8 +642,10 @@ unpack_and_move() {
             local z
             for z in "${zips[@]}"; do
                 if [[ "$DRY_RUN" == true ]]; then log "[would] unzip → Загрузка: ${z##*/}"; continue; fi
-                # -o : перезаписывать без запроса (иначе unzip зависает на вводе)
-                unzip -q -o -d "$ZAGRUZKA" -- "$z" >/dev/null 2>&1 || warn "  ошибка распаковки: ${z##*/}"
+                # -o : перезаписывать без запроса (иначе unzip зависает на вводе); сама
+                # распаковка идёт в тамбур, поэтому чужие файлы затёрты не будут.
+                _extract_via_tmp "$ZAGRUZKA" unzip -q -o -d '{}' -- "$z" \
+                    || warn "  ошибка распаковки: ${z##*/}"
             done
             _mv_into "$OTRABOTKA_P" "${zips[@]}"
             STATS[zip]=$(( STATS[zip] + ${#zips[@]} ))
@@ -624,10 +730,29 @@ generate_pdtv() {
         [[ "$ENABLE_OPEN" == true ]] && open_bg "$pdtv_file"
     fi
 
-    # Перенос бланков doc/docx/txt/odt → Отработанные/<дата>
-    local -a blanks=()
-    mapfile -d '' blanks < <(find "$ZAGRUZKA" -maxdepth 1 -type f "${_DOC_PRED[@]}" -print0 2>/dev/null || true)
-    _mv_into "$OTRABOTKA_P" "${blanks[@]:-}"
+    # В архив дня убираем ТОЛЬКО бланки, которые скрипт сам упаковал в M2 (их zip
+    # тут же распаковал M3 — ради попадания в перечень ПДТВ). Всё прочее содержимое
+    # «Загрузки» — это файлы из ПРИСЛАННЫХ архивов: они должны лечь во «Входящие»,
+    # чем и займётся M6. Раньше отсюда выгребались все doc/txt/odt подряд, и документ,
+    # лежавший в архиве рядом с вложенным архивом, уезжал в папку с датой.
+    [[ "$MOVE_M2_BLANKS_TO_DONE" == true ]] || return 0
+    (( ${#_M2_BLANKS[@]} )) || return 0
+    local -a blanks=() found=()
+    mapfile -d '' found < <(find "$ZAGRUZKA" -maxdepth 1 -type f "${_DOC_PRED[@]}" -print0 2>/dev/null || true)
+    # Ключ снимаем сразу: если в присланном архиве оказался файл с тем же именем,
+    # что у нашего бланка, второй экземпляр останется во «Входящих», а не уедет в архив.
+    local b key
+    for b in "${found[@]:-}"; do
+        [[ -n "$b" ]] || continue
+        key="${b##*/}"
+        if [[ -n "${_M2_BLANKS[$key]:-}" ]]; then
+            # Индекс раскрывает сам unset — кавычки одинарные, иначе имя с '*' или '[' сглобится.
+            blanks+=( "$b" ); unset '_M2_BLANKS[$key]'
+        fi
+    done
+    (( ${#blanks[@]} )) || return 0
+    vlog "  Бланки в архив дня: ${#blanks[@]}"
+    _mv_into "$OTRABOTKA_P" "${blanks[@]}"
     return 0
 }
 
@@ -649,7 +774,8 @@ _post_source() {
 _sevenzip() {
     local f="$1" out="$2"
     command -v 7z >/dev/null 2>&1 || { warn "  7z не найден — пропуск: ${f##*/}"; return 2; }
-    if 7z e -y -p"" -o"$out" -- "$f" >/dev/null 2>&1; then _post_source "$f"; return 0; fi
+    # -o без пробела перед путём — таково требование 7z, потому '{}' приклеен.
+    if _extract_via_tmp "$out" 7z e -y -p"" '-o{}' -- "$f"; then _post_source "$f"; return 0; fi
     return 2
 }
 
@@ -670,7 +796,8 @@ extract_archive() {
     case "$low" in
         *.tar|*.tar.gz|*.tgz|*.tar.bz2|*.tbz|*.tbz2|*.tar.xz|*.txz)
             command -v tar >/dev/null 2>&1 || { warn "  tar не найден — пропуск: ${f##*/}"; return 2; }
-            tar -xf "$f" -C "$out" >/dev/null 2>&1 || return 2   # GNU/bsdtar сами определяют сжатие
+            # GNU/bsdtar сами определяют сжатие
+            _extract_via_tmp "$out" tar -xf "$f" -C '{}' || return 2
             _post_source "$f"; return 0 ;;
         *.gz)   _decompress gzip  "$f"; return $? ;;
         *.bz2)  _decompress bzip2 "$f"; return $? ;;
@@ -1046,8 +1173,41 @@ _confirm() {
     fi
 }
 
-# Минимально необходимые каталоги: Входящие, ПДТВ, ! Отработанные.
+# Минимально необходимые каталоги: Входящие, ПДТВ, 00_Отработанные.
 # Если их нет — предложить создать (а не падать с ошибкой).
+# Переезд «! Отработанные» → «00_Отработанные». Восклицательный знак и пробел в
+# имени каталога ломали автооткрытие (см. комментарий у open_bg). Если новый каталог
+# уже есть — вливаем в него содержимое старого и убираем пустой старый.
+migrate_done_dir() {
+    [[ "$MIGRATE_DONE_DIR" == true ]] || return 0
+    [[ "$OTRABOTKA" == "$OTRABOTKA_OLD" ]] && return 0
+    [[ -d "$OTRABOTKA_OLD" ]] || return 0
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log "[would] переименовать: ${OTRABOTKA_OLD##*/} → ${OTRABOTKA##*/}"; return 0
+    fi
+
+    if [[ ! -e "$OTRABOTKA" ]]; then
+        if mv -- "$OTRABOTKA_OLD" "$OTRABOTKA" 2>/dev/null; then
+            ok "Каталог переименован: «! Отработанные» → «$DONE_DIR_NAME»"
+        else
+            warn "  не удалось переименовать «! Отработанные» — работаю со старым именем"
+            OTRABOTKA="$OTRABOTKA_OLD"
+            OTRABOTKA_P="$OTRABOTKA/$PERIOD"; ZAGRUZKA="$OTRABOTKA_P/Загрузка"
+        fi
+        return 0
+    fi
+
+    # Оба каталога существуют — переносим содержимое старого в новый.
+    local -a items=()
+    mapfile -d '' items < <(find "$OTRABOTKA_OLD" -mindepth 1 -maxdepth 1 -print0 2>/dev/null || true)
+    (( ${#items[@]} )) && _mv_into "$OTRABOTKA" "${items[@]}"
+    rmdir -- "$OTRABOTKA_OLD" 2>/dev/null \
+        && ok "Старый каталог «! Отработанные» слит в «$DONE_DIR_NAME»" \
+        || warn "  «! Отработанные» не пуст — проверьте вручную: $OTRABOTKA_OLD"
+    return 0
+}
+
 ensure_base_dirs() {
     if [[ ! -d "$ROOT" ]]; then
         if _confirm "Корневой каталог не найден: «$ROOT». Создать?"; then
@@ -1197,7 +1357,7 @@ gui_configure() {
         --text="Заполняйте только то, что нужно ИЗМЕНИТЬ. Пустое поле = текущее значение.
 Введённые значения сохранятся и подставятся при следующем запуске (и в ярлык).
 
-РАБОЧАЯ ПАПКА (корень) — внутри неё: «Входящие», «ПДТВ», «! Отработанные»." \
+РАБОЧАЯ ПАПКА (корень) — внутри неё: «Входящие», «ПДТВ», «00_Отработанные»." \
         --add-entry="РАБОЧАЯ ПАПКА — откуда/куда (сейчас: $ROOT)" \
         --add-entry="Рабочая дата ДД.ММ.ГГГГ (пусто = сегодня $DATE)" \
         --add-entry="Дежурный, ФИО (пусто = $cur_fio)" \
@@ -1369,11 +1529,30 @@ main() {
     # Замок от двойного запуска: у каждого дежурного свой ярлык, но рабочая
     # папка общая — параллельная обработка перемешала бы перенос файлов.
     # flock — штатный util-linux; замок снимается сам при выходе процесса.
-    if command -v flock >/dev/null 2>&1 && exec 9>"$ROOT/.pdtv.lock"; then
-        if ! flock -n 9; then
-            die "Обработка уже идёт (другой запуск в «$ROOT») — дождитесь завершения"
+    #
+    # Файл замка общий для всех дежурных. Созданный админом, он получает права 644 и
+    # рядовой оператор не может открыть его на запись — прогон падал бы «Permission denied»
+    # ещё до обработки. Поэтому: права 666, а при неудаче — работаем без замка, не умирая.
+    if command -v flock >/dev/null 2>&1; then
+        local _lock="$ROOT/.pdtv.lock"
+        # Доступность проверяем ЗАРАНЕЕ, отдельной командой: «exec 9>файл 2>/dev/null»
+        # без команды применил бы подавление stderr ко всему скрипту — предупреждения
+        # молча исчезли бы до самого конца прогона.
+        if : > "$_lock" 2>/dev/null || [[ -w "$_lock" ]]; then
+            chmod 666 "$_lock" 2>/dev/null || true
+            exec 9>"$_lock"
+            if ! flock -n 9; then
+                die "Обработка уже идёт (другой запуск в «$ROOT») — дождитесь завершения"
+            fi
+        else
+            warn "  нет доступа к файлу замка ($_lock) — работаю без защиты от двойного запуска"
+            note "проверьте права: chmod 666 «$_lock»"
         fi
     fi
+
+    # Переезд «! Отработанные» → «00_Отработанные». Строго ПОД ЗАМКОМ: два дежурных,
+    # стартовавших одновременно, иначе переименовывали бы каталог друг у друга из-под ног.
+    migrate_done_dir
 
     [[ "$ENABLE_PDTV" == true ]] && resolve_officer
     vlog "Пользователь: ${USER:-?} | GECOS: '${GECOS_FULL}' | ФИО: '${FIO}'"
