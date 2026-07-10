@@ -1,8 +1,8 @@
 #!/bin/bash
 #===============================================================================
 # pdtv — Обработчик входящих документов: распаковка, ПДТВ
-# Версия: 1.1
-# Совместимость: Astra Linux 1.7+ , Alt Linux 10.4+
+# Версия: 1.3.1
+# Совместимость: Astra Linux 1.6+ , Alt Linux 10.4+
 #===============================================================================
 #
 # Copyright 2026 Dmitriy Lebedev
@@ -90,7 +90,7 @@
 set -Eeuo pipefail
 
 # === Блок: версия ===
-VERSION="1.3"
+VERSION="1.3.1"
 
 #===============================================================================
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -312,6 +312,18 @@ _is_archive_file() {
         zip|7z|rar|gzip|bzip2|xz) return 0 ;;
     esac
     return 1
+}
+
+# Все распаковываемые архивы в «Загрузке» (включая «.deep»), \0-разделённые.
+# Служебные каталоги «.unpack.*» пропускаем: там идёт незавершённая распаковка.
+_scan_archives() {
+    local -a all=()
+    local f
+    mapfile -d '' all < <(find "$ZAGRUZKA" -type f -not -path '*/.unpack.*' -print0 2>/dev/null || true)
+    for f in "${all[@]:-}"; do
+        [[ -n "$f" ]] && _is_archive_file "$f" && printf '%s\0' "$f"
+    done
+    return 0
 }
 
 # Локаль UTF-8 — критично для регистронезависимого поиска кириллицы (-iname "О*")
@@ -576,6 +588,9 @@ _extract_via_tmp() {
     local tmp rc=0
     [[ -d "$dst" ]] || mkdir -p "$dst" 2>/dev/null || true
     tmp="$(mktemp -d "${dst}/.unpack.XXXXXX" 2>/dev/null)" || return 2
+    # Прерывание с клавиатуры не должно оставлять «.unpack.*» в каталоге назначения.
+    # Ловим именно сигналы: RETURN на SIGINT не срабатывает — оболочка умирает раньше.
+    trap 'rm -rf -- "$tmp" 2>/dev/null || true' INT TERM
     # «$@» — команда распаковки; {} заменяем на временный каталог
     local -a cmd=()
     local a
@@ -588,6 +603,7 @@ _extract_via_tmp() {
         (( ${#items[@]} )) && _mv_into "$dst" "${items[@]}"
     fi
     rm -rf -- "$tmp" 2>/dev/null || true
+    trap - INT TERM
     return $rc
 }
 
@@ -848,13 +864,10 @@ handle_archives() {
     local depth=0
     while (( depth < MAX_NEST_DEPTH )); do
         # Архивы ищем не только по расширению, но и ПО СОДЕРЖИМОМУ — чтобы поймать
-        # архив с неговорящим расширением.
-        # Архивы ищем и в «.deep» тоже: подархив может лежать внутри подархива.
-        local -a allf=() arcs=()
-        mapfile -d '' allf < <(find "$ZAGRUZKA" -type f -not -path '*/.unpack.*' -print0 2>/dev/null || true)
-        local _af; for _af in "${allf[@]:-}"; do
-            [[ -n "$_af" ]] && _is_archive_file "$_af" && arcs+=( "$_af" )
-        done
+        # архив с неговорящим расширением. И в «.deep» тоже: подархив может лежать
+        # внутри подархива.
+        local -a arcs=()
+        mapfile -d '' arcs < <(_scan_archives)
         (( ${#arcs[@]} == 0 )) && break        # архивов не осталось
 
         (( depth > 0 )) && vlog "  Вложенность, уровень $depth (архивов: ${#arcs[@]})"
@@ -878,11 +891,8 @@ handle_archives() {
     done
 
     # Предупредить, если после лимита глубины архивы всё ещё остались
-    local -a stillall=() still=()
-    mapfile -d '' stillall < <(find "$ZAGRUZKA" -type f -not -path '*/.unpack.*' -print0 2>/dev/null || true)
-    local _sf; for _sf in "${stillall[@]:-}"; do
-        [[ -n "$_sf" ]] && _is_archive_file "$_sf" && still+=( "$_sf" )
-    done
+    local -a still=()
+    mapfile -d '' still < <(_scan_archives)
     (( ${#still[@]} )) && warn "  достигнут предел вложенности ($MAX_NEST_DEPTH) — осталось архивов: ${#still[@]}"
     return 0
 }
@@ -914,10 +924,18 @@ deep_extract() {
 final_cleanup() {
     step M6 "Финальная очистка"
 
-    # Удаление оставшихся (нераспакованных) архивов из «Загрузки», включая «.deep»
+    # Оставшиеся (нераспакованные) архивы из «Загрузки», включая «.deep».
+    # По умолчанию удаляем: это копии, извлечённые из родительских архивов, а сами
+    # родители уже лежат в «Отработанных». С --keep-archives ничего не теряем —
+    # переносим их в архив дня.
     local -a leftover=()
     mapfile -d '' leftover < <(find "$ZAGRUZKA" -type f "${_ARC_PRED[@]}" -print0 2>/dev/null || true)
-    _rm_list "${leftover[@]:-}"
+    if (( ${#leftover[@]} )) && [[ "$KEEP_ARCHIVES" == true ]]; then
+        vlog "  --keep-archives: остатки архивов → архив дня (${#leftover[@]})"
+        _mv_into "$OTRABOTKA_P" "${leftover[@]}"
+    else
+        _rm_list "${leftover[@]:-}"
+    fi
 
     # Раскладка остатка. РЕКУРСИВНО (без -maxdepth): архивы нередко распаковываются
     # во вложенную папку — иначе извлечённые файлы (напр. PDF) остались бы в «Загрузке»
@@ -998,21 +1016,29 @@ open_documents() {
 # УПРАВЛЕНИЕ МОДУЛЯМИ (--only / --skip / --list-modules)
 #===============================================================================
 # Имена модулей для CLI: blanks unzip pdtv extract cleanup chmod open
+# Единственный источник правды: имя модуля → имя его переменной-выключателя.
+# MODULE_ORDER задаёт порядок ВЫВОДА в --list-modules и в чек-листе GUI
+# (ассоциативный массив порядок не хранит). С порядком выполнения в main() он
+# намеренно не совпадает: там chmod идёт после open — права накатываются на уже
+# открытые файлы.
+MODULE_ORDER=( blanks unzip pdtv extract cleanup chmod open )
+declare -A MODULE_VAR=(
+    [blanks]=ENABLE_ARCHIVE_BLANKS   [unzip]=ENABLE_UNPACK_ZIP
+    [pdtv]=ENABLE_PDTV               [extract]=ENABLE_EXTRACT
+    [cleanup]=ENABLE_CLEANUP         [chmod]=ENABLE_CHMOD
+    [open]=ENABLE_OPEN
+)
+
+# Значение выключателя модуля (true|false).
+module_state() { printf '%s' "${!MODULE_VAR[$1]}"; }
+
 set_module() {
     local n="$1" v="$2"
-    case "$n" in
-        blanks)  ENABLE_ARCHIVE_BLANKS=$v ;;
-        unzip)   ENABLE_UNPACK_ZIP=$v ;;
-        pdtv)    ENABLE_PDTV=$v ;;
-        extract) ENABLE_EXTRACT=$v ;;
-        cleanup) ENABLE_CLEANUP=$v ;;
-        chmod)   ENABLE_CHMOD=$v ;;
-        open)    ENABLE_OPEN=$v ;;
-        *)       die "Неизвестный модуль: '$n' (см. --list-modules)" ;;
-    esac
+    [[ -n "${MODULE_VAR[$n]:-}" ]] || die "Неизвестный модуль: '$n' (см. --list-modules)"
+    printf -v "${MODULE_VAR[$n]}" '%s' "$v"
 }
 
-all_modules() { printf '%s\n' blanks unzip pdtv extract cleanup chmod open; }
+all_modules() { printf '%s\n' "${MODULE_ORDER[@]}"; }
 
 set_modules_csv() {  # set_modules_csv <true|false> <csv>
     local v="$1" csv="$2" item
@@ -1022,16 +1048,9 @@ set_modules_csv() {  # set_modules_csv <true|false> <csv>
 
 list_modules() {
     printf 'Модули (имя — статус):\n'
-    local m var st
-    for m in $(all_modules); do
-        case "$m" in
-            blanks)  var=$ENABLE_ARCHIVE_BLANKS ;;
-            unzip)   var=$ENABLE_UNPACK_ZIP ;;
-            pdtv)    var=$ENABLE_PDTV ;;       extract) var=$ENABLE_EXTRACT ;;
-            cleanup) var=$ENABLE_CLEANUP ;;    chmod)  var=$ENABLE_CHMOD ;;
-            open)    var=$ENABLE_OPEN ;;
-        esac
-        [[ "$var" == true ]] && st="включён" || st="выключен"
+    local m st
+    for m in "${MODULE_ORDER[@]}"; do
+        [[ "$(module_state "$m")" == true ]] && st="включён" || st="выключен"
         printf '  %-9s — %s\n' "$m" "$st"
     done
 }
@@ -1226,8 +1245,8 @@ ensure_base_dirs() {
     local d
     for d in "$VHOD" "$PDTV" "$OTRABOTKA"; do
         [[ -d "$d" ]] && continue
-        if _confirm "Не найден каталог «${d#$ROOT/}». Создать?"; then
-            run mkdir -p "$d"; ok "Создан каталог: ${d#$ROOT/}"
+        if _confirm "Не найден каталог «${d#"$ROOT"/}». Создать?"; then
+            run mkdir -p "$d"; ok "Создан каталог: ${d#"$ROOT"/}"
         else
             warn "Каталог не создан: $d (некоторые этапы могут не сработать)"
         fi
@@ -1382,17 +1401,10 @@ gui_configure() {
     save_config
 
     # Чек-лист модулей: предвыбраны включённые
-    local m on
+    local m
     local -a rows=()
-    for m in blanks unzip pdtv extract cleanup chmod open; do
-        case "$m" in
-            blanks)  on=$ENABLE_ARCHIVE_BLANKS ;;
-            unzip)   on=$ENABLE_UNPACK_ZIP ;;
-            pdtv)    on=$ENABLE_PDTV ;;            extract) on=$ENABLE_EXTRACT ;;
-            cleanup) on=$ENABLE_CLEANUP ;;         chmod)   on=$ENABLE_CHMOD ;;
-            open)    on=$ENABLE_OPEN ;;
-        esac
-        rows+=( "$on" "$m" )
+    for m in "${MODULE_ORDER[@]}"; do
+        rows+=( "$(module_state "$m")" "$m" )
     done
     if znt --list --checklist --title="ПДТВ — модули" \
         --text="Отметьте этапы обработки, которые выполнять" \

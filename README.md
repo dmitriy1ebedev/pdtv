@@ -2,7 +2,7 @@
 
 **Обработчик входящих документов: распаковка и формирование ПДТВ**
 
-![Версия](https://img.shields.io/badge/версия-1.3-blue)
+![Версия](https://img.shields.io/badge/версия-1.3.1-blue)
 ![Лицензия](https://img.shields.io/badge/лицензия-Apache%202.0-green)
 ![Astra Linux](https://img.shields.io/badge/Astra%20Linux-1.6%20%7C%201.7-orange)
 ![Alt Linux](https://img.shields.io/badge/Alt%20Linux-10.4-blue)
@@ -153,7 +153,7 @@ sudo apt install zip unzip p7zip-full tar gzip bzip2 xz-utils zenity xdg-utils c
 | `--month` / `--no-month` | уровень месяца в каталогах: «`01 Январь/<дата>`» |
 | `--officer ФИО` | задать ФИО дежурного вручную (перебивает GECOS) |
 | `--max-depth N` | глубина распаковки «архив в архиве» (по умолчанию 5) |
-| `--keep-archives` | не удалять исходные архивы, а переносить в «Отработанные» |
+| `--keep-archives` | не удалять архивы, оставшиеся после предела вложенности (`--max-depth`), а переносить их в «Отработанные» |
 | `--gui` / `--no-gui` | принудительно открыть / никогда не открывать окно Zenity |
 | `--make-shortcut` | создать ярлык на рабочем столе с текущей конфигурацией и выйти; в имени и подписи ярлыка — ФИО дежурного (`--officer`), поэтому у каждого дежурного свой ярлык |
 | `--only СПИСОК` | выполнить ТОЛЬКО эти модули (через запятую) |
