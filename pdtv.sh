@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # pdtv — Обработчик входящих документов: распаковка, ПДТВ
-# Версия: 1.3.5
+# Версия: 1.3.6
 # Совместимость: Astra Linux 1.6+ , Alt Linux 10.4+
 #===============================================================================
 #
@@ -90,7 +90,7 @@
 set -Eeuo pipefail
 
 # === Блок: версия ===
-VERSION="1.3.5"
+VERSION="1.3.6"
 
 #===============================================================================
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -1359,6 +1359,31 @@ Icon=utilities-terminal
 Categories=Utility;Office;
 EOF
     chmod +x "$target" 2>/dev/null || true
+
+    # Кладём копию ещё и на РЕАЛЬНЫЙ рабочий стол, чтобы оператор её сразу видел
+    # (Astra 1.8: ярлык только в $HOME оператор «не находит»). Путь стола берём у
+    # xdg-user-dir (он разруливает Desktop/«Рабочий стол»/Desktops), иначе перебор
+    # известных вариантов. $HOME-копия остаётся как стабильный запас.
+    local desk=""
+    if command -v xdg-user-dir >/dev/null 2>&1; then
+        desk="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+    fi
+    if [[ -z "$desk" || ! -d "$desk" || "$desk" == "$HOME" ]]; then
+        local d
+        for d in "$HOME/Desktop" "$HOME/Рабочий стол" "$HOME/Desktops/Desktop1"; do
+            [[ -d "$d" ]] && { desk="$d"; break; }
+        done
+    fi
+    if [[ -n "$desk" && -d "$desk" && "$desk" != "$HOME" ]]; then
+        if cp -f "$target" "$desk/pdtv${suffix}.desktop" 2>/dev/null; then
+            chmod +x "$desk/pdtv${suffix}.desktop" 2>/dev/null || true
+            # Astra Fly показывает ярлык на столе только «доверенным» — метим.
+            command -v gio >/dev/null 2>&1 && \
+                gio set "$desk/pdtv${suffix}.desktop" "metadata::trusted" true 2>/dev/null || true
+            printf '%s' "$desk/pdtv${suffix}.desktop"   # видимый путь — на столе
+            return 0
+        fi
+    fi
     printf '%s' "$target"          # только путь в stdout (для захвата вызывающим)
 }
 
@@ -1436,7 +1461,7 @@ gui_action() {
             --extra-button="Создать ярлык в домашнем каталоге" || rc=$?
         if [[ "$ZNT_OUT" == "Создать ярлык в домашнем каталоге" ]]; then
             local made; made="$(make_home_shortcut)"
-            znt --info --title="ПДТВ" --text="Ярлык создан в домашнем каталоге:\n$made\n\nЕго можно скопировать на рабочий стол или в любое место." || true
+            znt --info --title="ПДТВ" --text="Ярлык создан:\n$made\n\nКопия — в домашнем каталоге. Если на рабочем столе не запускается, откройте ПКМ → «Разрешить запуск»." || true
             continue                       # вернуться к выбору: запустить или отмена
         elif (( rc != 0 )); then
             note "Запуск отменён пользователем"; exit 0
@@ -1726,7 +1751,7 @@ main() {
 
     # Создать ярлык и выйти (без обработки)
     if [[ "$_MAKE_SHORTCUT" == true ]]; then
-        local _t; _t="$(make_home_shortcut)"; ok "Ярлык создан в домашнем каталоге: $_t"; exit 0
+        local _t; _t="$(make_home_shortcut)"; ok "Ярлык создан: $_t (копия — в домашнем каталоге)"; exit 0
     fi
 
     # Графический режим: окно настроек + выбор «Запустить / Создать ярлык»
