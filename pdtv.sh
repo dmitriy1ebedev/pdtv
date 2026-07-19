@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # pdtv — Обработчик входящих документов: распаковка, ПДТВ
-# Версия: 1.3.6
+# Версия: 1.3.7
 # Совместимость: Astra Linux 1.6+ , Alt Linux 10.4+
 #===============================================================================
 #
@@ -90,7 +90,7 @@
 set -Eeuo pipefail
 
 # === Блок: версия ===
-VERSION="1.3.6"
+VERSION="1.3.7"
 
 #===============================================================================
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -627,6 +627,37 @@ prepare_environment() {
     local -a txts=()
     mapfile -d '' txts < <(find "$PDTV" -maxdepth 1 -type f -iname '*.txt' -print0 2>/dev/null || true)
     _mv_into "$PDTV_P" "${txts[@]:-}"
+
+    warn_unknown_incoming
+    return 0
+}
+
+# Файлы в корне «Входящих», которые НЕ возьмёт ни один модуль (нет расширения
+# или расширение вне известных). Раньше такой файл молча игнорировался, и
+# оператор получал «пустой ПДТВ, хотя файл лежит» (Astra 1.8, тест6): теперь
+# причина видна прямо в терминале/сводке. `file(1)` подсказывает содержимое.
+warn_unknown_incoming() {
+    local -a known=( "${DOC_EXTS[@]}" "${ARCHIVE_EXTS[@]}" "${OPEN_EXTS[@]}" gpg pgp )
+    local f base ext k hit hint
+    while IFS= read -r -d '' f; do
+        base="${f##*/}"
+        if [[ "$base" == *.* && "$base" != .* ]]; then
+            hit=false
+            for k in "${known[@]}"; do
+                # составные (tar.gz) и простые расширения, без регистра
+                shopt -s nocasematch
+                [[ "$base" == *".$k" ]] && hit=true
+                shopt -u nocasematch
+                [[ "$hit" == true ]] && break
+            done
+            [[ "$hit" == true ]] && continue
+            ext="${base##*.}"
+            warn "  «$base» лежит во «Входящих», но расширение .$ext обработчику не знакомо — файл останется на месте"
+        else
+            hint="$(file -b -- "$f" 2>/dev/null | cut -c1-60)"
+            warn "  «$base» лежит во «Входящих» БЕЗ расширения — обработчик его не возьмёт${hint:+ (похоже: $hint)}. Переименуйте с расширением (например, .txt)"
+        fi
+    done < <(find "$VHOD" -maxdepth 1 -type f -print0 2>/dev/null || true)
     return 0
 }
 
@@ -1742,6 +1773,11 @@ main() {
     parse_args "$@"
     setup_colors
     trap 'on_error "$LINENO"' ERR
+    # Под root конфиг и ярлык лягут в /root — оператор со своей учётки их не
+    # увидит и получит «конфига нет / ярлык не создался» (логи Astra 1.8, 18.07).
+    if (( EUID == 0 )); then
+        warn "Запуск под root: конфиг/ярлык сохранятся для root, а не для оператора. Запускайте под учёткой оператора."
+    fi
     load_config              # подставить сохранённые ROOT/ФИО (CLI важнее)
 
     if [[ "$_DO_LIST_MODULES" == true ]]; then list_modules; exit 0; fi
