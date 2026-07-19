@@ -1323,6 +1323,83 @@ want_gui() {
     [[ "$HAD_ARGS" == false && -n "${DISPLAY:-}" ]] && command -v zenity >/dev/null 2>&1
 }
 
+# Итоговая секция диагностики: сама проверяет типовые грабли (Astra 1.8 и не
+# только) и печатает оператору ГОТОВЫЕ команды. Каждая строка: ⚠/• проблема →
+# что сделать. Нет проблем — «✓». Только вывод, ничего не меняет.
+_diag_advice() {
+    local bad=0 dsk dpath dexec dbin d
+
+    # 1) zenity: без него нет окна настроек («не даёт выбрать, всё сразу»).
+    if ! command -v zenity >/dev/null 2>&1; then
+        bad=1
+        echo "⚠ Нет zenity — окно настроек НЕ открывается, запуск по ярлыку молча идёт в обработку."
+        echo "  → sudo apt install zenity"
+    fi
+    # 2) Открывалки: gio/fly-open/xdg-open (хоть одна должна быть).
+    if ! command -v gio >/dev/null 2>&1 && ! command -v fly-open >/dev/null 2>&1 \
+            && ! command -v xdg-open >/dev/null 2>&1; then
+        bad=1
+        echo "⚠ Нет ни одной открывалки (gio/fly-open/xdg-open) — файлы не будут открываться сами."
+        echo "  → sudo apt install xdg-utils"
+    fi
+    # 3) Битая MIME-ассоциация text/plain: ПДТВ создаётся, но «не открывается».
+    dsk="$(command -v xdg-mime >/dev/null 2>&1 && xdg-mime query default text/plain 2>/dev/null || true)"
+    if [[ -n "$dsk" ]]; then
+        dpath=""
+        for d in "$HOME/.local/share/applications" /usr/local/share/applications /usr/share/applications; do
+            [[ -f "$d/$dsk" ]] && { dpath="$d/$dsk"; break; }
+        done
+        dbin=""
+        if [[ -n "$dpath" ]]; then
+            dexec="$(grep -m1 '^Exec=' "$dpath" 2>/dev/null | cut -d= -f2-)"
+            dbin="${dexec%% *}"
+        fi
+        if [[ -z "$dpath" ]] || ! command -v "$dbin" >/dev/null 2>&1; then
+            bad=1
+            echo "⚠ Ассоциация text/plain ведёт на «$dsk», а программы нет — ПДТВ не будет открываться сам."
+            echo "  → установить её (например: sudo apt install kate) ИЛИ назначить существующий редактор:"
+            echo "    xdg-mime default <имя.desktop> text/plain   (варианты: ls /usr/share/applications | grep -iE 'edit|kate|text')"
+        fi
+    fi
+    # 4) Архиваторы: rar-архивы без unrar/unar остаются нераспакованными.
+    if ! command -v unrar >/dev/null 2>&1 && ! command -v unar >/dev/null 2>&1 \
+            && ! command -v 7z >/dev/null 2>&1; then
+        bad=1
+        echo "⚠ Нет unrar/unar/7z — архивы RAR останутся нераспакованными."
+        echo "  → sudo apt install p7zip-full"
+    fi
+    if ! command -v zip >/dev/null 2>&1; then
+        bad=1
+        echo "⚠ Нет zip — модуль упаковки бланков (M2) пропускается, ПДТВ будет пустым."
+        echo "  → sudo apt install zip"
+    fi
+    # 5) Запуск под root: конфиг/ярлык лягут не туда.
+    if (( EUID == 0 )); then
+        bad=1
+        echo "⚠ Диагностика снята под root — конфиг и ярлык живут в /root, оператор их не увидит."
+        echo "  → запускать скрипт и диагностику под учёткой оператора"
+    fi
+    # 6) Рабочая папка.
+    if [[ ! -d "$ROOT" ]]; then
+        bad=1
+        echo "⚠ Рабочая папка «$ROOT» не существует — обработка упадёт на первом шаге."
+        echo "  → укажите реальную: pdtv.sh --root \"/путь/к/папке\" (или через окно настроек)"
+    elif [[ -d "$VHOD" ]]; then
+        # Файлы, которые обработчик не возьмёт (без расширения / чужое расширение).
+        local f base
+        while IFS= read -r -d '' f; do
+            base="${f##*/}"
+            if [[ "$base" != *.* || "$base" == .* ]]; then
+                bad=1
+                echo "⚠ Во «Входящих» лежит «$base» БЕЗ расширения — обработчик его не возьмёт (ПДТВ выйдет пустым)."
+                echo "  → переименуйте, добавив расширение (например: «$base.txt»)"
+            fi
+        done < <(find "$VHOD" -maxdepth 1 -type f -print0 2>/dev/null || true)
+    fi
+    (( bad == 0 )) && echo "✓ Типовых проблем не найдено: zenity, открывалки, ассоциации, архиваторы, права — в порядке."
+    return 0
+}
+
 # Astra 1.8: zenity выпал из базовой поставки (логи стенда 18.07) — запуск по
 # ярлыку молча шёл в обработку без окна настроек («не даёт выбрать»). Говорим
 # оператору прямо: чем открыть рот окну (apt install zenity) и что произошло.
@@ -1738,6 +1815,10 @@ run_diagnostic() {
         # zenity на удалённом стенде; без tty и без DISPLAY _confirm считает «да».
         env -u DISPLAY bash "$script" --dry-run --verbose --no-color --no-pause --no-gui \
             --root "$ROOT" ${OFFICER_CLI:+--officer "$OFFICER_CLI"} 2>&1
+        echo
+
+        echo "--- 15. ВЫВОДЫ И РЕКОМЕНДАЦИИ (автопроверка типовых проблем) ---"
+        _diag_advice
         echo
         echo "================ КОНЕЦ ОТЧЁТА ================"
     ) > "$out" 2>&1
