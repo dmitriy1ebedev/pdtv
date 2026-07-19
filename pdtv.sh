@@ -1323,6 +1323,27 @@ want_gui() {
     [[ "$HAD_ARGS" == false && -n "${DISPLAY:-}" ]] && command -v zenity >/dev/null 2>&1
 }
 
+# Astra 1.8: zenity выпал из базовой поставки (логи стенда 18.07) — запуск по
+# ярлыку молча шёл в обработку без окна настроек («не даёт выбрать»). Говорим
+# оператору прямо: чем открыть рот окну (apt install zenity) и что произошло.
+# Сообщение — первым доступным способом: kdialog/xmessage/notify-send, иначе
+# в терминал. Показывается ОДИН раз за запуск и только когда окно ждали
+# (без аргументов, DISPLAY есть, zenity нет).
+warn_no_zenity_gui() {
+    [[ "$HAD_ARGS" == false && -n "${DISPLAY:-}" ]] || return 0
+    command -v zenity >/dev/null 2>&1 && return 0
+    local msg="Окно настроек ПДТВ недоступно: не установлен пакет zenity (в Astra 1.8 его нет в базовой поставке). Обработка выполнена с сохранёнными настройками. Чтобы вернуть окно, попросите администратора выполнить: sudo apt install zenity"
+    warn "$msg"
+    if command -v kdialog >/dev/null 2>&1; then
+        kdialog --title "pdtv" --sorry "$msg" >/dev/null 2>&1 || true
+    elif command -v xmessage >/dev/null 2>&1; then
+        xmessage -center "$msg" >/dev/null 2>&1 || true
+    elif command -v notify-send >/dev/null 2>&1; then
+        notify-send "pdtv" "$msg" >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
 # Безопасный вызов zenity. Штатный ненулевой код (Отмена / доп.кнопка) НЕ должен
 # дёргать ERR-trap: errtrace (set -E) протаскивает ловушку в субшелл подстановки
 # команд, поэтому даже обёртка set +e не спасала и появлялась ложная
@@ -1547,7 +1568,9 @@ run_diagnostic() {
         local c p ver
         for c in bash find sed sort paste grep tr wc file stat \
                  zip unzip 7z 7za 7zr tar gzip bzip2 xz unrar unar \
-                 gpg gio fly-open xdg-open xdg-user-dir zenity flock; do
+                 gpg gio fly-open xdg-open xdg-user-dir zenity flock \
+                 kdialog fly-dialog Xdialog dialog whiptail xmessage \
+                 notify-send kate; do
             p="$(command -v "$c" 2>/dev/null)"
             if [[ -n "$p" ]]; then
                 ver="$("$c" --version 2>&1 | head -1)"
@@ -1661,8 +1684,32 @@ run_diagnostic() {
 
         echo "--- 10. Открытие файлов: MIME-ассоциации ---"
         echo "OPEN_TOOL=$OPEN_TOOL  порядок: ${OPEN_TOOLS[*]}"
+        # Битая ассоциация — типовой корень «ПДТВ создан, но не открылся»
+        # (Astra 1.8: text/plain → kate.desktop, а самого kate может не быть).
+        # Для каждого MIME: чей .desktop назначен, найден ли он на диске и
+        # существует ли программа из его Exec.
+        local dsk dpath dexec dbin d
         for m in text/plain application/vnd.oasis.opendocument.text application/msword; do
-            echo "  xdg-mime default $m: $(command -v xdg-mime >/dev/null 2>&1 && xdg-mime query default "$m" 2>&1 || echo '(нет xdg-mime)')"
+            dsk="$(command -v xdg-mime >/dev/null 2>&1 && xdg-mime query default "$m" 2>/dev/null || true)"
+            if [[ -z "$dsk" ]]; then
+                echo "  $m: (ассоциации нет или нет xdg-mime)"
+                continue
+            fi
+            dpath=""
+            for d in "$HOME/.local/share/applications" /usr/local/share/applications /usr/share/applications; do
+                [[ -f "$d/$dsk" ]] && { dpath="$d/$dsk"; break; }
+            done
+            if [[ -z "$dpath" ]]; then
+                echo "  $m: $dsk — .desktop НЕ НАЙДЕН (битая ассоциация!)"
+                continue
+            fi
+            dexec="$(grep -m1 '^Exec=' "$dpath" 2>/dev/null | cut -d= -f2-)"
+            dbin="${dexec%% *}"
+            if [[ -n "$dbin" ]] && command -v "$dbin" >/dev/null 2>&1; then
+                echo "  $m: $dsk → $dbin (программа на месте)"
+            else
+                echo "  $m: $dsk → Exec='$dexec' — ПРОГРАММА НЕ НАЙДЕНА (вот почему «не открывается»)"
+            fi
         done
         echo
 
@@ -1794,6 +1841,8 @@ main() {
     if want_gui; then
         gui_configure
         gui_action
+    else
+        warn_no_zenity_gui
     fi
 
     ensure_utf8_locale
