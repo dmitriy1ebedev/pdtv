@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 # pdtv — Обработчик входящих документов: распаковка, ПДТВ
-# Версия: 1.3.7
+# Версия: 1.3.8
 # Совместимость: Astra Linux 1.6+ , Alt Linux 10.4+
 #===============================================================================
 #
@@ -90,7 +90,7 @@
 set -Eeuo pipefail
 
 # === Блок: версия ===
-VERSION="1.3.7"
+VERSION="1.3.8"
 
 #===============================================================================
 # ╔══════════════════════════════════════════════════════════════════════════╗
@@ -1414,12 +1414,17 @@ warn_no_zenity_gui() {
     command -v zenity >/dev/null 2>&1 && return 0
     local msg="Окно настроек ПДТВ не показано: нет пакета zenity (в Astra 1.8 его нет в базовой поставке). Это НЕ ошибка — обработка выполнена с сохранёнными настройками. На офлайн-машине zenity ставить НЕ нужно (apt без репозитория может повредить рабочий стол); настройки задавайте ключами запуска."
     warn "$msg"
+    # Порядок важен для КИРИЛЛИЦЫ: xmessage дефолтным шрифтом рисует UTF-8 как
+    # кракозябры (лог АРМ Astra 1.8, 20.07), поэтому он — последний и только с
+    # юникод-шрифтом (iso10646-1). Раньше пробуем kdialog и notify-send, которые
+    # кириллицу отображают штатно.
     if command -v kdialog >/dev/null 2>&1; then
         kdialog --title "pdtv" --sorry "$msg" >/dev/null 2>&1 || true
-    elif command -v xmessage >/dev/null 2>&1; then
-        xmessage -center "$msg" >/dev/null 2>&1 || true
     elif command -v notify-send >/dev/null 2>&1; then
         notify-send "pdtv" "$msg" >/dev/null 2>&1 || true
+    elif command -v xmessage >/dev/null 2>&1; then
+        xmessage -center -fn '-*-*-medium-r-normal--16-*-*-*-*-*-iso10646-1' "$msg" >/dev/null 2>&1 \
+            || xmessage -center "$msg" >/dev/null 2>&1 || true
     fi
     return 0
 }
@@ -1493,28 +1498,31 @@ EOF
     chmod +x "$target" 2>/dev/null || true
 
     # Кладём копию ещё и на РЕАЛЬНЫЙ рабочий стол, чтобы оператор её сразу видел
-    # (Astra 1.8: ярлык только в $HOME оператор «не находит»). Путь стола берём у
-    # xdg-user-dir (он разруливает Desktop/«Рабочий стол»/Desktops), иначе перебор
-    # известных вариантов. $HOME-копия остаётся как стабильный запас.
-    local desk=""
+    # (Astra 1.8: ярлык только в $HOME оператор «не находит»). ВАЖНО: на Fly
+    # xdg-user-dir отдаёт /home/user/Desktop, но реально видимый стол —
+    # ~/Desktops/Desktop1 (лог АРМ 20.07), поэтому копируем во ВСЕ существующие
+    # варианты каталога стола, а не только в первый найденный. $HOME-копия —
+    # стабильный запас. Первый успешно записанный путь показываем оператору.
+    local first_on_desk="" d
+    local -a desks=("$HOME/Desktop" "$HOME/Рабочий стол" "$HOME/Desktops/Desktop1")
     if command -v xdg-user-dir >/dev/null 2>&1; then
-        desk="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+        local xd; xd="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+        [[ -n "$xd" ]] && desks+=("$xd")
     fi
-    if [[ -z "$desk" || ! -d "$desk" || "$desk" == "$HOME" ]]; then
-        local d
-        for d in "$HOME/Desktop" "$HOME/Рабочий стол" "$HOME/Desktops/Desktop1"; do
-            [[ -d "$d" ]] && { desk="$d"; break; }
-        done
-    fi
-    if [[ -n "$desk" && -d "$desk" && "$desk" != "$HOME" ]]; then
-        if cp -f "$target" "$desk/pdtv${suffix}.desktop" 2>/dev/null; then
-            chmod +x "$desk/pdtv${suffix}.desktop" 2>/dev/null || true
-            # Astra Fly показывает ярлык на столе только «доверенным» — метим.
+    for d in "${desks[@]}"; do
+        [[ -n "$d" && -d "$d" && "$d" != "$HOME" ]] || continue
+        if cp -f "$target" "$d/pdtv${suffix}.desktop" 2>/dev/null; then
+            chmod +x "$d/pdtv${suffix}.desktop" 2>/dev/null || true
+            # Astra Fly показывает ярлык на столе только «доверенным» — метим
+            # (gio есть не везде: на этом АРМ его нет — тогда просто пропускаем).
             command -v gio >/dev/null 2>&1 && \
-                gio set "$desk/pdtv${suffix}.desktop" "metadata::trusted" true 2>/dev/null || true
-            printf '%s' "$desk/pdtv${suffix}.desktop"   # видимый путь — на столе
-            return 0
+                gio set "$d/pdtv${suffix}.desktop" "metadata::trusted" true 2>/dev/null || true
+            [[ -z "$first_on_desk" ]] && first_on_desk="$d/pdtv${suffix}.desktop"
         fi
+    done
+    if [[ -n "$first_on_desk" ]]; then
+        printf '%s' "$first_on_desk"   # видимый путь — на столе
+        return 0
     fi
     printf '%s' "$target"          # только путь в stdout (для захвата вызывающим)
 }
