@@ -2,7 +2,7 @@
 
 **Обработчик входящих документов: распаковка и формирование ПДТВ**
 
-![Версия](https://img.shields.io/badge/версия-1.3.8-blue)
+![Версия](https://img.shields.io/badge/версия-1.3.9-blue)
 ![Лицензия](https://img.shields.io/badge/лицензия-Apache%202.0-green)
 ![Astra Linux](https://img.shields.io/badge/Astra%20Linux-1.6%20%7C%201.7-orange)
 ![Alt Linux](https://img.shields.io/badge/Alt%20Linux-10.4-blue)
